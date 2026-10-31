@@ -1,34 +1,85 @@
+const DEFAULT_UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'
+
+const requestJson = async (url, options, label) => {
+  const response = await fetch(url, options)
+  const body = await response.text()
+  let data
+
+  try {
+    data = body ? JSON.parse(body) : {}
+  } catch {
+    throw new Error(`${label}返回了非 JSON 响应 (HTTP ${response.status})`)
+  }
+
+  if (!response.ok) {
+    throw new Error(`${label} HTTP ${response.status}: ${data?.message || '请求失败'}`)
+  }
+
+  return data
+}
+
 const glados = async () => {
   const notice = []
-  if (!process.env.GLADOS) return
-  for (const cookie of String(process.env.GLADOS).split('\n')) {
-    if (!cookie) continue
+  if (!process.env.GLADOS?.trim()) {
+    throw new Error('未配置 GLADOS Secret')
+  }
+
+  // GLaDOS 自 2026-09-24 起校验 UA，多账号时 GLADOS_UA 按行对应。
+  const cookies = String(process.env.GLADOS).split('\n').map((value) => value.trim()).filter(Boolean)
+  const agents = String(process.env.GLADOS_UA || '').split('\n').map((value) => value.trim()).filter(Boolean)
+  const domain = String(process.env.DOMAIN || 'glados.cloud')
+    .trim()
+    .replace(/^https?:\/\//i, '')
+    .replace(/\/+$/, '')
+
+  console.log(`目标域名: ${domain}`)
+  console.log(`账号数量: ${cookies.length}`)
+
+  for (const [index, cookie] of cookies.entries()) {
+    const accountNo = index + 1
     try {
       const common = {
         'cookie': cookie,
-        'referer': 'https://glados.cloud/console/checkin',
-        'user-agent': 'Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 6.0)',
+        'referer': `https://${domain}/console/checkin`,
+        'user-agent': agents[index] || agents[0] || DEFAULT_UA,
       }
-      const action = await fetch('https://glados.cloud/api/user/checkin', {
+      const action = await requestJson(`https://${domain}/api/user/checkin`, {
         method: 'POST',
         headers: { ...common, 'content-type': 'application/json' },
-        body: '{"token":"glados.one"}',
-      }).then((r) => r.json())
-      if (action?.code) throw new Error(action?.message)
-      const status = await fetch('https://glados.cloud/api/user/status', {
+        body: JSON.stringify({ token: domain }),
+      }, '签到接口')
+
+      console.log(`[账号${accountNo}] 签到响应: code=${action?.code ?? '无'} message=${action?.message || '无'}`)
+      const alreadyCheckedIn = action?.code === 1
+      if (action?.code !== 0 && !alreadyCheckedIn) {
+        throw new Error(
+          `${action?.message || '签到失败'} (code=${action?.code}${action?.reason ? `, reason=${action.reason}` : ''})`
+        )
+      }
+
+      const status = await requestJson(`https://${domain}/api/user/status`, {
         method: 'GET',
         headers: { ...common },
-      }).then((r) => r.json())
-      if (status?.code) throw new Error(status?.message)
+      }, '状态接口')
+
+      if (status?.code !== 0) {
+        throw new Error(`状态接口异常: ${status?.message || '未知错误'} (code=${status?.code})`)
+      }
+
+      const leftDays = Number(status?.data?.leftDays)
+      console.log(`[账号${accountNo}] 签到成功，剩余 ${leftDays} 天`)
       notice.push(
         'Checkin OK',
-        `${action?.message}`,
-        `Left Days ${Number(status?.data?.leftDays)}`
+        `${alreadyCheckedIn ? '今日已签到过' : action?.message}`,
+        `Left Days ${leftDays}`
       )
     } catch (error) {
+      console.error(`[账号${accountNo}] 签到失败: ${error.message}`)
       notice.push(
         'Checkin Error',
-        `${error}`,
+        `账号${accountNo}: ${error.message}`,
         `<${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}>`
       )
     }
@@ -101,7 +152,16 @@ const notify = async (notice) => {
 }
 
 const main = async () => {
-  await notify(await glados())
+  const notice = await glados()
+  await notify(notice)
+
+  // 通知照常发送，但签到失败时让 GitHub Actions 显示失败而不是假绿。
+  if (Array.isArray(notice) && notice.includes('Checkin Error')) {
+    process.exitCode = 1
+  }
 }
 
-main()
+main().catch((error) => {
+  console.error(`运行失败: ${error.message}`)
+  process.exitCode = 1
+})
